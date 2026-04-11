@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-#from distributed import init_distributed
+from distributed import init_distributed
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
