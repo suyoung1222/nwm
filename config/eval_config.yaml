@@ -33,3 +33,15 @@ eval_datasets:
     data_folder: /home/suyoung/mydata/NWM/preprocessed/datasets/go_stanford
     test: data_splits/go_stanford/test/
     goals_per_obs: 4
+  limo2:
+    data_folder: /home/suyoung/Documents/limo/agilex_open_class/limo/limo_gazebo_sim/scripts/dataset_mocap/realsense_1/nwm_dataset
+    test: data_splits/limo2/test/
+    goals_per_obs: 4
+  limo1:
+    data_folder: /home/suyoung/Documents/limo/agilex_open_class/limo/limo_gazebo_sim/scripts/dataset/straight_yaw_2/nwm_dataset
+    test: data_splits/limo1/test/
+    goals_per_obs: 4
+  limo5:
+    data_folder: /home/suyoung/Documents/limo/agilex_open_class/limo/limo_gazebo_sim/scripts/dataset/straight_yaw_2/nwm_dataset
+    test: data_splits/limo5/test/
+    goals_per_obs: 4

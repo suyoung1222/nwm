@@ -16,3 +16,12 @@ go_stanford:
 
 sacson:
   metric_waypoint_spacing: 0.255
+
+limo2:
+  metric_waypoint_spacing: 0.0507
+
+limo1:
+  metric_waypoint_spacing: 0.0190
+
+limo5:
+  metric_waypoint_spacing: 0.0189
