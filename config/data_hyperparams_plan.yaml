@@ -10,3 +10,6 @@ scand:
 sacson:
   mu: [-0.33, 0, 0]
   var_scale: [0.03, 0.1, 0.1]
+limo2:
+  mu: [-0.33, 0, 0]
+  var_scale: [0.02, 0.05, 0.1]

@@ -44,3 +44,8 @@ datasets:
     train: data_splits/scand/train
     test: data_splits/scand/test
     goals_per_obs: 4
+  limo2:
+    data_folder: /home/suyoung/Documents/limo/agilex_open_class/limo/limo_gazebo_sim/scripts/dataset_mocap/realsense_1/nwm_dataset
+    train: data_splits/limo2/train/
+    test: data_splits/limo2/test/
+    goals_per_obs: 4
