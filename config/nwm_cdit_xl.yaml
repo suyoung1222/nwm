@@ -49,3 +49,8 @@ datasets:
     train: data_splits/limo2/train/
     test: data_splits/limo2/test/
     goals_per_obs: 4
+  bunker:
+    data_folder: /home/suyoung/mydata/topomaps/nwm
+    train: /home/suyoung/mydata/topomaps/nwm
+    test: /home/suyoung/mydata/topomaps/nwm
+    goals_per_obs: 4

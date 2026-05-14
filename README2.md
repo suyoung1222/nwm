@@ -1,6 +1,7 @@
 export RESULTS_FOLDER=/home/suyoung/Documents/Git/nwm/logs/results
 Checkpoints: in ./logs/nwm_cdit_xl/checkpoints
 Dataset folders: /home/suyoung/mydata/NWM
+bag_to_nwm.py --bag ~/dataset/3.bag --dataset_name bunker2024 --traj_name bunker2024 #custom rosbag file
 
 테스트데이터 쓸만한거 recon, scand
 
@@ -11,7 +12,7 @@ test
 python isolated_nwm_infer.py \
     --exp config/nwm_cdit_xl.yaml \
     --ckp cdit_xl_ego4d_200000 \
-    --datasets limo1 \
+    --datasets bunker \
     --batch_size 16 \
     --num_workers 12 \
     --eval_type rollout \

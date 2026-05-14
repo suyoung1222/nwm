@@ -25,3 +25,6 @@ limo1:
 
 limo5:
   metric_waypoint_spacing: 0.0189
+
+bunker:
+  metric_waypoint_spacing: 0.0189

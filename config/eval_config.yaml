@@ -45,3 +45,7 @@ eval_datasets:
     data_folder: /home/suyoung/Documents/limo/agilex_open_class/limo/limo_gazebo_sim/scripts/dataset/straight_yaw_2/nwm_dataset
     test: data_splits/limo5/test/
     goals_per_obs: 4
+  bunker:
+    data_folder: /home/suyoung/mydata/topomaps/nwm
+    test: /home/suyoung/mydata/topomaps/nwm
+    goals_per_obs: 4

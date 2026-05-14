@@ -21,7 +21,7 @@ import distributed as dist
 from models import CDiT_models
 from datasets import EvalDataset
 from PIL import Image
-
+import time
 
 def save_image(output_file, img, unnormalize_img):
     img = img.detach().cpu()
@@ -65,8 +65,8 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
 @torch.no_grad()
 def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, latent_size, device, num_cond, num_goals=1, rel_t=None, progress=False):
     model, diffusion, vae = all_models
-    x = curr_obs.to(device)
-    y = curr_delta.to(device)
+    x = curr_obs.to(device) #현재관측
+    y = curr_delta.to(device) # 액션
 
     with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
         B, T = x.shape[:2]
@@ -77,13 +77,13 @@ def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, laten
 
         x = x.flatten(0,1)
         x = vae.encode(x).latent_dist.sample().mul_(0.18215).unflatten(0, (B, T))
-        x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+        x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1) # 컨디션 (B*num_goals, num_cond, C, H, W)
         z = torch.randn(B*num_goals, 4, latent_size, latent_size, device=device)
         y = y.flatten(0, 1)
         model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)      
         samples = diffusion.p_sample_loop(
                 model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=progress, device=device
-        )
+        ) # NWM 출력
         samples = vae.decode(samples / 0.18215).sample
 
         return torch.clip(samples, -1., 1.)
@@ -99,8 +99,10 @@ def generate_rollout(args, output_dir, rollout_fps, idxs, all_models, obs_image,
         if args.gt:
             x_pred_pixels = gt_image[:, i].clone().to(device)
         else:
+            start_time = time.time()
             x_pred_pixels = model_forward_wrapper(all_models, curr_obs, curr_delta, rollout_stride, args.latent_size, num_cond=num_cond, num_goals=1, device=device)
-
+            end_time = time.time()
+            print(f"Time taken for model_forward_wrapper: {end_time - start_time:.4f} seconds")
         curr_obs = torch.cat((curr_obs, x_pred_pixels.unsqueeze(1)), dim=1) # append current prediction
         curr_obs = curr_obs[:, 1:] # remove first observation
         visualize_preds(output_dir, idxs, i, x_pred_pixels)
@@ -112,7 +114,10 @@ def generate_time(args, output_dir, idxs, all_models, obs_image, gt_output, delt
         if args.gt:
             x_pred_pixels = gt_output[:, timestep-1].clone().to(device)
         else:
+            start_time = time.time()
             x_pred_pixels = model_forward_wrapper(all_models, obs_image, curr_delta, timestep, args.latent_size, num_cond=num_cond, num_goals=1, device=device)
+            end_time = time.time()
+            print(f"Time taken for model_forward_wrapper: {end_time - start_time:.4f} seconds")
         visualize_preds(output_dir, idxs, sec, x_pred_pixels)
 
 def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
@@ -159,7 +164,7 @@ def main(args):
     print("loading")
     model_lst = (None, None, None)
     if not args.gt:
-        model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4)
+        model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4) # 모델 불러오기
         ckp = torch.load(f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
         print(model.load_state_dict(ckp["ema"], strict=True))
         model.eval()
