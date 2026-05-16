@@ -1,5 +1,5 @@
 run_name: wm_debug_bs_32_
-
+# from_checkpoint: ./checkpoint/cdit_xl_ego4d_200000.pth.tar  # resume from latest.pth.tar instead
 # training setup
 results_dir: logs
 use_wandb: True # set to false if you don't want to log to wandb
@@ -27,8 +27,8 @@ len_traj_pred: 64
 # dataset specific parameters
 image_size: 224
 datasets:
-  recon:
-    data_folder: /checkpoint/amaia/video/amirbar/processed_datasets/recon
-    train: data_splits/recon/train/ # path to train folder with traj_names.txt
-    test: data_splits/recon/test/ # path to test folder with traj_names.txt
-    goals_per_obs: 4 # how many goals are sampled per observation
+  bunker2025:
+      data_folder: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data/bunker2025
+      train: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025
+      test: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025
+      goals_per_obs: 4

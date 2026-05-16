@@ -28,3 +28,6 @@ limo5:
 
 bunker:
   metric_waypoint_spacing: 0.0189
+
+bunker2025:
+  metric_waypoint_spacing: 0.275

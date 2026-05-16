@@ -49,3 +49,7 @@ eval_datasets:
     data_folder: /home/suyoung/mydata/topomaps/nwm
     test: /home/suyoung/mydata/topomaps/nwm
     goals_per_obs: 4
+  bunker2025:
+      data_folder: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025
+      test: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025
+      goals_per_obs: 4

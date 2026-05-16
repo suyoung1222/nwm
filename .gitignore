@@ -10,3 +10,8 @@ data_splits/**/dataset*.pkl
 data
 README2.md
 README3.md
+slurm/
+checkpoint/
+*.zip
+*.sbatch
+*.mp4

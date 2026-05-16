@@ -16,3 +16,6 @@ limo2:
 bunker:
   mu: [-0.33, 0, 0]
   var_scale: [0.02, 0.05, 0.1]
+bunker2025:
+  mu: [-0.25, 0, 0]
+  var_scale: [0.04, 0.1, 0.1]
