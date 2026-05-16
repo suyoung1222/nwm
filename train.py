@@ -146,12 +146,14 @@ def main(args):
     print('Searching for model from ', checkpoint_dir)
     start_epoch = 0
     train_steps = 0
+    # finetune_mode: load only model/EMA weights, reset optimizer and step counters
+    finetune_mode = config.get('finetune_mode', False)
     if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
         if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
             raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
         latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
-        print("Loading model from ", latest_path)
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
+        print("Loading model from", latest_path, "| finetune_mode=" + str(finetune_mode))
+        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
 
         if "model" in latest_checkpoint:
             model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
@@ -164,19 +166,22 @@ def main(args):
         else:
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
 
-        if "opt" in latest_checkpoint:
-            opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
-            opt.load_state_dict(opt_ckp)
-            print("Loading optimizer params")
-        
-        if "epoch" in latest_checkpoint:
-            start_epoch = latest_checkpoint['epoch'] + 1
-        
-        if "train_steps" in latest_checkpoint:
-            train_steps = latest_checkpoint["train_steps"]
-        
-        if "scaler" in latest_checkpoint:
-            scaler.load_state_dict(latest_checkpoint["scaler"])
+        if not finetune_mode:
+            if "opt" in latest_checkpoint:
+                opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
+                opt.load_state_dict(opt_ckp)
+                print("Loading optimizer params")
+
+            if "epoch" in latest_checkpoint:
+                start_epoch = latest_checkpoint['epoch'] + 1
+
+            if "train_steps" in latest_checkpoint:
+                train_steps = latest_checkpoint["train_steps"]
+
+            if "scaler" in latest_checkpoint and bfloat_enable:
+                scaler.load_state_dict(latest_checkpoint["scaler"])
+        else:
+            print("Finetune mode: skipping optimizer/epoch/steps — starting fresh")
         
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:

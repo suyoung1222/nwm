@@ -1,0 +1,30 @@
+run_name: ft_bunker2025
+
+# Fine-tuning from pretrained CDiT-XL checkpoint
+from_checkpoint: checkpoint/cdit_xl_ego4d_200000.pth.tar
+finetune_mode: True   # load model/EMA weights only; reset optimizer and step counters
+
+# training setup
+results_dir: logs
+batch_size: 16
+num_workers: 8
+model: CDiT-XL/2
+lr: 2e-5   # lower LR for fine-tuning (was 8e-5 in pretraining)
+
+normalize: True
+grad_clip_val: 10.0
+context_size: 4
+
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+len_traj_pred: 64
+image_size: 224
+
+datasets:
+  bunker2025:
+    data_folder: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data/bunker2025
+    train: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025/train
+    test: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025/test
+    goals_per_obs: 4
