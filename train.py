@@ -129,6 +129,7 @@ def main(args):
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     num_cond = config['context_size']
     model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4).to(device)
+    # Model이 받는 context는 (B, m, 4, H/8, W/8) 형태의 VAE latent. m=4이면 프레임당 32×32=1024개 token이 4프레임 = 4096 context tokens.
     
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)

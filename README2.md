@@ -3,7 +3,7 @@ Checkpoints: in ./logs/nwm_cdit_xl/checkpoints
 Dataset folders: /home/suyoung/mydata/NWM
 bag_to_nwm.py --bag ~/dataset/3.bag --dataset_name bunker2024 --traj_name bunker2024 #custom rosbag file
 
-테스트데이터 쓸만한거 recon, scand
+OC-NWM
 
 (gt preparation, one-time)
 python isolated_nwm_infer.py     --exp config/nwm_cdit_xl.yaml     --datasets limo1     --batch_size 96     --num_workers 12     --eval_type time     --output_dir ${RESULTS_FOLDER}     --gt 1

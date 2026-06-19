@@ -30,4 +30,4 @@ bunker:
   metric_waypoint_spacing: 0.0189
 
 bunker2025:
-  metric_waypoint_spacing: 0.275
+  metric_waypoint_spacing: 0.2678 # UMass AgileX Bunker outdoor (mean step spacing over 7 seqs)

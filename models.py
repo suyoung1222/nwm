@@ -233,10 +233,10 @@ class CDiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed[self.context_size:]
         x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
         x_cond = x_cond.flatten(1, 2)
-        t = self.t_embedder(t[..., None])
-        y = self.y_embedder(y) 
-        time_emb = self.time_embedder(rel_t[..., None])
-        c = t + time_emb + y # if training on unlabeled data, dont add y.
+        t = self.t_embedder(t[..., None])               # diffusion step → ψ_t
+        y = self.y_embedder(y)                          # action (x,y,angle) → ψ_a
+        time_emb = self.time_embedder(rel_t[..., None]) # timeshift k → ψ_k
+        c = t + time_emb + y # if training on unlabeled data, dont add y. # ξ = ψ_a + ψ_k + ψ_t  (Eq.3)
 
         for block in self.blocks:
             x = block(x, c, x_cond)
