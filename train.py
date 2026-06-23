@@ -37,6 +37,7 @@ from models import CDiT_models
 from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
+from logging_utils import TrainLogger, make_rollout_images, gpu_utilization, gpu_mem_gb
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -88,6 +89,62 @@ def create_logger(logging_dir):
     return logger
 
 #################################################################################
+#         Fine-tuning helpers (ADDITIVE — inert unless config opts in)          #
+#################################################################################
+
+class DistributedWeightedSampler(torch.utils.data.Sampler):
+    """DDP-safe weighted sampler for data mixing.
+
+    Every rank draws the SAME global multinomial (same seed+epoch), then takes a
+    disjoint stride-shard, so the per-batch new/old mixing ratio is honored
+    across the whole world without overlap. Mirrors DistributedSampler's
+    set_epoch / sharding contract so train.py's loop is unchanged.
+    """
+
+    def __init__(self, weights, num_replicas, rank, seed=0, replacement=True):
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.replacement = replacement
+        self.epoch = 0
+        # one epoch == one pass over the dataset, evenly split across ranks
+        self.total_size = len(self.weights)
+        self.num_samples = self.total_size // num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        idx = torch.multinomial(self.weights, self.total_size, self.replacement, generator=g)
+        idx = idx[self.rank:self.num_replicas * self.num_samples:self.num_replicas]
+        return iter(idx.tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+
+def build_mixing_weights(dataset_sizes, dataset_names, new_names, mix_ratio_new):
+    """Per-sample weights so E[fraction of NEW samples] == mix_ratio_new,
+    independent of dataset sizes. Aligned to ConcatDataset's global index order
+    (datasets concatenated in `dataset_names` order)."""
+    n_new = sum(s for s, n in zip(dataset_sizes, dataset_names) if n in new_names)
+    n_old = sum(s for s, n in zip(dataset_sizes, dataset_names) if n not in new_names)
+    weights = torch.zeros(sum(dataset_sizes), dtype=torch.double)
+    off = 0
+    for s, name in zip(dataset_sizes, dataset_names):
+        if name in new_names:
+            w = (mix_ratio_new / n_new) if n_new > 0 else 0.0
+        else:
+            w = ((1.0 - mix_ratio_new) / n_old) if n_old > 0 else 0.0
+        weights[off:off + s] = w
+        off += s
+    return weights
+
+
+#################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
@@ -110,7 +167,22 @@ def main(args):
     with open(args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
-    
+
+    # Optional CLI overrides (ADDITIVE; for sbatch convenience). Only applied
+    # when explicitly passed, so the YAML config is the single source of truth
+    # otherwise. Lets the sbatch expose run name / checkpoint / mix ratio as
+    # top-level variables without editing the config file.
+    if getattr(args, 'run_name', None):
+        config['run_name'] = args.run_name
+    if getattr(args, 'from_checkpoint', None):
+        config['from_checkpoint'] = args.from_checkpoint
+    if getattr(args, 'mix_ratio_new', None) is not None:
+        config['mix_ratio_new'] = args.mix_ratio_new
+    if getattr(args, 'only_new_data', False):
+        config['only_new_data'] = True
+    if getattr(args, 'auto_resume', False):
+        config['auto_resume'] = True
+
     # Setup an experiment folder:
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_dir = f"{config['results_dir']}/{config['run_name']}"  # Create an experiment folder
@@ -121,6 +193,16 @@ def main(args):
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
         logger = create_logger(None)
+
+    # Experiment trackers (ADDITIVE): wandb + tensorboard, rank-0 only, with
+    # graceful fallback. tb logs go under a per-run subdir; wandb is configured
+    # via env vars (see logging_utils). Never affects training math.
+    train_logger = TrainLogger(
+        run_name=config['run_name'],
+        log_dir=os.path.join(experiment_dir, "tb"),
+        config=config,
+        enabled=(rank == 0),
+    )
 
     # Create model:
     tokenizer = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
@@ -137,6 +219,11 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     lr = float(config.get('lr', 1e-4))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+    # Fine-tuning schedule knobs (ADDITIVE; 0 == original behavior):
+    #   warmup_steps>0 : linear 0 -> lr over the first N optimizer steps, then constant.
+    #   max_steps>0    : hard stop once train_steps reaches this count.
+    warmup_steps = int(config.get('warmup_steps', 0))
+    max_steps = int(config.get('max_steps', 0))
 
     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
     if bfloat_enable:
@@ -149,10 +236,21 @@ def main(args):
     train_steps = 0
     # finetune_mode: load only model/EMA weights, reset optimizer and step counters
     finetune_mode = config.get('finetune_mode', False)
-    if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
-        if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
-            raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
-        latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
+    # auto_resume (ADDITIVE, opt-in via config/--auto-resume): for Slurm requeue.
+    # When latest.pth.tar exists, resume from it FULLY (optimizer + step counters)
+    # and ignore from_checkpoint, instead of raising. Default off -> original
+    # behavior (raise on ambiguity) is unchanged.
+    auto_resume = config.get('auto_resume', False)
+    have_latest = os.path.isfile(latest_path)
+    if auto_resume and have_latest:
+        finetune_mode = False  # requeue must continue optimizer/steps, not restart
+    if have_latest or config.get('from_checkpoint', 0):
+        if have_latest and config.get('from_checkpoint', 0):
+            if auto_resume:
+                print("auto_resume: latest.pth.tar found -> resuming from it; ignoring from_checkpoint")
+            else:
+                raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
+        latest_path = latest_path if have_latest else config.get('from_checkpoint', 0)
         print("Loading model from", latest_path, "| finetune_mode=" + str(finetune_mode))
         latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
 
@@ -189,10 +287,15 @@ def main(args):
         model = torch.compile(model)
     model = DDP(model, device_ids=[device])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    # Fewer-step diffusion used ONLY for periodic rollout-image logging (faster
+    # sampling for viz). Does not touch the training objective above.
+    sample_diffusion = create_diffusion(timestep_respacing="250")
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     train_dataset = []
     test_dataset = []
+    train_dataset_names = []  # parallel to train_dataset, for mixing weights
+    test_dataset_names = []   # parallel to test_dataset, for split val logging
 
     for dataset_name in config["datasets"]:
         data_config = config["datasets"][dataset_name]
@@ -232,22 +335,64 @@ def main(args):
                     )
                     if data_split_type == "train":
                         train_dataset.append(dataset)
+                        train_dataset_names.append(dataset_name)
                     else:
                         test_dataset.append(dataset)
+                        test_dataset_names.append(dataset_name)
                     print(f"Dataset: {dataset_name} ({data_split_type}), size: {len(dataset)}")
+
+    # Per-group val datasets for SEPARATED rollout logging (old replay vs new
+    # UMass) so catastrophic forgetting is visible. Built before wrapping into a
+    # single ConcatDataset; references the same underlying datasets (no reload).
+    new_names_for_val = set(config.get('new_datasets', []))
+    val_old = [d for d, n in zip(test_dataset, test_dataset_names) if n not in new_names_for_val]
+    val_new = [d for d, n in zip(test_dataset, test_dataset_names) if n in new_names_for_val]
 
     # combine all the datasets from different robots
     print(f"Combining {len(train_dataset)} datasets.")
+    dataset_sizes = [len(d) for d in train_dataset]  # before ConcatDataset wraps them
     train_dataset = ConcatDataset(train_dataset)
     test_dataset = ConcatDataset(test_dataset)
 
-    sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
+    # Small fixed val batches (rank 0 only) used purely for rollout images.
+    def _first_val_batch(ds_list, n=4):
+        if not ds_list:
+            return None
+        ds = ConcatDataset(ds_list)
+        dl = DataLoader(ds, batch_size=n, shuffle=True, num_workers=2, drop_last=True)
+        try:
+            return next(iter(dl))
+        except StopIteration:
+            return None
+    val_batch_old = _first_val_batch(val_old) if rank == 0 else None
+    val_batch_new = _first_val_batch(val_new) if rank == 0 else None
+
+    # Data mixing (ADDITIVE): if mix_ratio_new is set (or only_new_data),
+    # sample with per-source weights to control the new/old ratio per batch.
+    # If neither key is present, fall back to the original uniform sampler.
+    new_names = set(config.get('new_datasets', []))
+    only_new = config.get('only_new_data', False)
+    mix_ratio_new = config.get('mix_ratio_new', None)
+    effective_mix = 1.0 if only_new else mix_ratio_new
+    if effective_mix is not None:
+        weights = build_mixing_weights(dataset_sizes, train_dataset_names, new_names, effective_mix)
+        sampler = DistributedWeightedSampler(
+            weights,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            seed=args.global_seed,
+        )
+        logger.info(f"Mixing sampler: new_datasets={sorted(new_names)} "
+                    f"mix_ratio_new={effective_mix} only_new_data={only_new} "
+                    f"(sizes={dict(zip(train_dataset_names, dataset_sizes))})")
+    else:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
     loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
@@ -267,6 +412,9 @@ def main(args):
     # Variables for monitoring/logging purposes:
     log_steps = 0
     running_loss = 0
+    running_mse = 0.0     # additive: accumulate diffusion MSE term
+    running_vb = 0.0      # additive: accumulate vlb term (0 if model has no vb)
+    last_grad_norm = None # additive: most recent total grad norm
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
@@ -278,7 +426,13 @@ def main(args):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             rel_t = rel_t.to(device, non_blocking=True)
-            
+
+            # Linear LR warmup (ADDITIVE; no-op when warmup_steps == 0):
+            if warmup_steps > 0:
+                cur_lr = lr * min(1.0, (train_steps + 1) / warmup_steps)
+                for pg in opt.param_groups:
+                    pg['lr'] = cur_lr
+
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
@@ -306,7 +460,8 @@ def main(args):
                 scaler.scale(loss).backward()
                 if config.get('grad_clip_val', 0) > 0:
                     scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val'])
+                    # clip_grad_norm_ already returns the total norm — capture for logging (no behavior change)
+                    last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val']).item()
                 scaler.step(opt)
                 scaler.update()
             
@@ -314,6 +469,9 @@ def main(args):
 
             # Log loss values:
             running_loss += loss.detach().item()
+            # Additive: accumulate loss components for logging (no math change)
+            running_mse += loss_dict["mse"].mean().item() if "mse" in loss_dict else 0.0
+            running_vb += loss_dict["vb"].mean().item() if "vb" in loss_dict else 0.0
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -327,8 +485,23 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
+                # Experiment-tracker logging (rank-0 no-op wrapper handles non-main ranks):
+                train_logger.log_scalars({
+                    "train/loss": avg_loss,
+                    "train/mse": running_mse / log_steps,
+                    "train/vb": running_vb / log_steps,
+                    "train/lr": opt.param_groups[0]["lr"],
+                    "train/grad_norm": last_grad_norm,
+                    "perf/steps_per_sec": steps_per_sec,
+                    "perf/samples_per_sec": samples_per_sec,
+                    "perf/gpu_util": gpu_utilization(),
+                    "perf/gpu_mem_gb": gpu_mem_gb(),
+                    "progress/epoch": epoch,
+                }, train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
+                running_mse = 0.0
+                running_vb = 0.0
                 log_steps = 0
                 start_time = time()
 
@@ -360,11 +533,35 @@ def main(args):
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
                 logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}")
+                # Experiment-tracker logging (rank 0): scalar + SEPARATED old/new
+                # val rollouts so forgetting (old) vs adaptation (new) is visible.
+                if rank == 0:
+                    train_logger.log_scalars(
+                        {"eval/perceptual_loss": float(sim_score)}, train_steps)
+                    for tag, vbatch in (("val_old", val_batch_old), ("val_new", val_batch_new)):
+                        if vbatch is None:
+                            continue
+                        try:
+                            imgs, caps = make_rollout_images(
+                                ema, tokenizer, sample_diffusion, vbatch,
+                                latent_size, device, num_cond, max_items=4)
+                            train_logger.log_images(f"rollout/{tag}", imgs, train_steps, caps)
+                        except Exception as e:
+                            logger.info(f"rollout logging for {tag} skipped: {e}")
+                dist.barrier()
+
+            # Optional hard step cap (ADDITIVE; no-op when max_steps == 0):
+            if max_steps > 0 and train_steps >= max_steps:
+                logger.info(f"Reached max_steps={max_steps}; stopping.")
+                break
+        if max_steps > 0 and train_steps >= max_steps:
+            break
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
+    train_logger.close()
     cleanup()
 
 
@@ -436,6 +633,17 @@ def get_args_parser():
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--bfloat16", type=int, default=1)
     parser.add_argument("--torch-compile", type=int, default=1)
+    # Optional config overrides (ADDITIVE; None/False -> use YAML value):
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="override config run_name (checkpoint/log subdir)")
+    parser.add_argument("--from-checkpoint", type=str, default=None,
+                        help="override config from_checkpoint (pretrained weights path)")
+    parser.add_argument("--mix-ratio-new", type=float, default=None,
+                        help="override config mix_ratio_new (expected fraction of NEW samples)")
+    parser.add_argument("--only-new-data", action="store_true",
+                        help="train on new_datasets only (overrides mix_ratio)")
+    parser.add_argument("--auto-resume", action="store_true",
+                        help="resume from latest.pth.tar if present (Slurm requeue), else from_checkpoint")
     return parser
 
 if __name__ == "__main__":

@@ -1,0 +1,124 @@
+# =============================================================================
+# Fine-tune CDiT-XL on UMass bunker2025, MIXED with the 5 pretraining datasets
+# to limit catastrophic forgetting.
+#
+# This config only ADDS keys; train.py reads them via config.get(...) with
+# defaults that reproduce the original behavior when a key is absent.
+#
+# IMPORTANT: every data_folder / split path below is the repo's convention
+# (relative paths resolve under PROJECT_DIR after `cd $PROJECT_DIR`). VERIFY /
+# EDIT each one for the actual Unity layout before launching.  [Unity 경로 확인]
+# =============================================================================
+
+run_name: ft_bunker2025_mix
+# Checkpoints -> logs/ft_bunker2025_mix/checkpoints/  (SEPARATE from the
+# pretrained dir logs/nwm_cdit_xl/... — the pretrained weights are never
+# overwritten). Change run_name to fork a new run.
+
+# ── resume / load pretrained ─────────────────────────────────────────────────
+# train.py checkpoint logic (UNCHANGED — see train.py:146-185):
+#   1) if logs/<run_name>/checkpoints/latest.pth.tar exists  -> FULL resume
+#      (model + ema + optimizer + epoch + train_steps). finetune_mode ignored.
+#   2) else                                                  -> load `from_checkpoint`
+#      weights only; finetune_mode=True resets optimizer/epoch/steps.
+# This is exactly the "auto-resume if a checkpoint exists, else start from the
+# pretrained weights" behavior the Slurm requeue (part C) relies on.
+#
+# Point `from_checkpoint` at the weights trained on the 5 existing datasets.
+# (Parametrized here; override on the sbatch command line if the path differs.)
+from_checkpoint: logs/nwm_cdit_xl/checkpoints/cdit_xl_ego4d_200000.pth.tar
+finetune_mode: True
+
+# ── model / fixed training setup (matches pretraining; do not change) ─────────
+results_dir: logs
+model: CDiT-XL/2
+image_size: 224
+context_size: 4
+normalize: True
+grad_clip_val: 10.0
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+len_traj_pred: 64
+
+batch_size: 16        # per-GPU batch (effective = batch_size * num_GPUs * goals_per_obs)
+num_workers: 8
+
+# ── fine-tuning hyperparameters (low LR + warmup) ────────────────────────────
+# Pretraining used a CONSTANT lr=8e-5 (config/nwm_cdit_xl.yaml). For fine-tuning
+# we start from already-good features, so we use a ~4x lower peak LR to avoid
+# clobbering them (a primary cause of catastrophic forgetting) and add a short
+# linear warmup so the freshly-reset AdamW moments (finetune_mode) settle before
+# hitting peak LR. After warmup the LR stays constant, matching the paper's
+# constant-LR schedule.
+lr: 2e-5              # peak LR  (pretraining: 8e-5)
+warmup_steps: 500    # linear 0 -> lr over the first 500 optimizer steps.
+                     # 0 disables warmup (== original constant-LR behavior).
+
+# Training length. --epochs (CLI, default 300) bounds epochs; max_steps gives a
+# hard step cap that's easier to reason about for fine-tuning. With ~tens of k
+# bunker2025 samples and 30% new mixing, ~20-40k steps is a reasonable start;
+# watch the val curves (part B) and stop when the new-data val plateaus before
+# the old-data val degrades.
+max_steps: 30000     # 0 = run for --epochs instead; >0 = hard stop at this step count
+
+# ── data mixing: catastrophic-forgetting control ─────────────────────────────
+# We replay the 5 pretraining datasets alongside the new UMass data instead of
+# fine-tuning on bunker2025 alone.
+#
+# new_datasets   : which dataset names below count as "new" (UMass); the rest
+#                  are "old" (replay).
+# mix_ratio_new  : EXPECTED fraction of NEW samples drawn per batch. It is
+#                  SIZE-INDEPENDENT: each new sample gets weight
+#                  mix_ratio_new / N_new, each old sample (1-mix_ratio_new) / N_old,
+#                  so the ratio holds regardless of how large each dataset is.
+# only_new_data  : True  -> train on new_datasets ONLY (no replay); mix_ratio
+#                  is overridden to 1.0. (Old datasets stay listed but get
+#                  zero sampling weight — same as "my data only".)
+#
+# Default 0.3: enough new data to adapt to the UMass domain, while 70% replay of
+# the original mixture preserves prior capabilities. Reasonable range 0.2-0.5.
+new_datasets: [bunker2025]
+mix_ratio_new: 0.3
+only_new_data: False
+
+# NOTE: if mix_ratio_new is REMOVED entirely, train.py falls back to the original
+# uniform DistributedSampler over the concatenated datasets (no behavior change).
+
+datasets:
+  # ----- 5 existing pretraining datasets (REPLAY) --------------------------
+  # Paths follow config/nwm_cdit_xl.yaml convention; VERIFY on Unity. [경로 확인]
+  recon:
+    data_folder: data/recon
+    train: data_splits/recon/train/
+    test: data_splits/recon/test/
+    goals_per_obs: 4
+  tartan_drive:
+    data_folder: data/tartan
+    train: data_splits/tartan_drive/train/
+    test: data_splits/tartan_drive/test/
+    goals_per_obs: 4
+  sacson:
+    data_folder: data/sacson
+    train: data_splits/sacson/train
+    test: data_splits/sacson/test
+    goals_per_obs: 4
+  scand:
+    data_folder: data/scand
+    train: data_splits/scand/train
+    test: data_splits/scand/test
+    goals_per_obs: 4
+  go_stanford:
+    # NOTE: locally only data_splits/go_stanford/test exists. Confirm the TRAIN
+    # split is present on Unity, or drop go_stanford from replay. [경로 확인]
+    data_folder: data/go_stanford
+    train: data_splits/go_stanford/train/
+    test: data_splits/go_stanford/test/
+    goals_per_obs: 4
+
+  # ----- new UMass dataset (TARGET) ----------------------------------------
+  bunker2025:
+    data_folder: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data/bunker2025
+    train: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025/train
+    test: /project/pi_hzhang2_umass_edu/suyoungkang_umass_edu/Git/nwm/data_splits/bunker2025/test
+    goals_per_obs: 4

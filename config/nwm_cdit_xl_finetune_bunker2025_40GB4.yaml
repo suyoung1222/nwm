@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------------
+# Low-LR fine-tune config for the custom `bunker2025` dataset.
+# Derived from config/nwm_cdit_xl.yaml. Architecture / model size are IDENTICAL
+# to the pretrained CDiT-XL/2 release (do NOT change `model`, context_size,
+# len_traj_pred, image_size, or distance bounds -- they must match the
+# pretrained checkpoint).
+#
+# Run with --finetune 1 (see scripts/finetune_bunker2025.sbatch). In fine-tune
+# mode train.py loads WEIGHTS ONLY from `finetune_ckpt`, starts a fresh
+# optimizer + LR schedule at global_step 0, monitors val loss for overfitting,
+# saves the best checkpoint, and early-stops.
+# ---------------------------------------------------------------------------
+
+run_name: nwm_cdit_xl_finetune_bunker2025_40GB4
+
+# training setup
+results_dir: logs
+train: True
+batch_size: 4          # per-GPU; lower to 8/4 if you hit OOM on smaller GPUs
+num_workers: 12
+model: CDiT-XL/2        # MUST match the pretrained checkpoint architecture
+lr: 1.0e-5              # ~1/8 of the from-scratch base (8e-5); exposed via --lr too
+
+# ---- fine-tune mode ----
+finetune: True
+# Pretrained checkpoint to load WEIGHTS ONLY from (stores weights under 'ema', 475/475 keys).
+# cdit_xl_100000 = navigation-domain run (epoch 294 / 100k steps) -> closer to bunker2025.
+# Alternative: logs/nwm_cdit_xl/checkpoints/cdit_xl_ego4d_200000.pth.tar (Ego4D pretrain).
+finetune_ckpt: logs/nwm_cdit_xl/checkpoints/cdit_xl_100000.pth.tar
+finetune_strict: True   # require exact weight-key match; abort with a clear error otherwise
+
+# ---- schedule / overfitting control (all exposed; CLI flags override these) ----
+warmup_steps: 200          # short linear warmup, then flat (no decay) low LR
+max_steps: 5000            # hard cap on optimizer steps (keeps the fine-tune light)
+val_every: 250             # run held-out val-loss eval every N steps
+early_stop_patience: 5     # stop after this many consecutive non-improving val evals
+early_stop_min_delta: 0.0  # min val improvement to reset patience
+val_max_batches: 20        # cap val batches per eval for speed (0 = full val set)
+dreamsim_eval: False       # keep the heavy DreamSim/internet eval off during fine-tuning
+
+# normalization for the action space
+normalize: True
+grad_clip_val: 10.0
+context_size: 4
+
+# distance bounds for distance and action and distance predictions
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+# action output params
+len_traj_pred: 64
+
+# dataset specific parameters
+image_size: 224
+
+# ---- ACTIVE dataset: only bunker2025 ----
+datasets:
+  bunker2025:
+    data_folder: /home/suyoung/mydata/NWM/preprocessed/datasets/bunker2025 #/scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/datasets/bunker2025
+    train: #/scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/data_splits/bunker2025/train   # seq1-6
+    test:  #/scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/data_splits/bunker2025/test    # seq7 (held-out val)
+    goals_per_obs: 4
+
+# ---- The original NWM datasets are intentionally DISABLED for this fine-tune.
+#      They are kept here (commented) so the entries are not lost. Re-enable by
+#      uncommenting and pointing data_folder at the processed data.
+#  recon:
+#    data_folder: data/recon
+#    train: data_splits/recon/train/
+#    test: data_splits/recon/test/
+#    goals_per_obs: 4
+#  tartan_drive:
+#    data_folder: data/tartan
+#    train: data_splits/tartan_drive/train/
+#    test: data_splits/tartan_drive/test/
+#    goals_per_obs: 4
+#  sacson:
+#    data_folder: data/sacson
+#    train: data_splits/sacson/train
+#    test: data_splits/sacson/test
+#    goals_per_obs: 4
+#  scand:
+#    data_folder: data/scand
+#    train: data_splits/scand/train
+#    test: data_splits/scand/test
+#    goals_per_obs: 4
