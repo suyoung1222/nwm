@@ -1,0 +1,14 @@
+# Extra dependencies for OCNWM frozen-VideoSAUR slot extraction / caching
+# (on top of the NWM training env, which already has torch, torchvision, numpy, pillow, pyyaml).
+#
+# NOTE on timm: the vendored VideoSAUR references the DINO model tag
+# `vit_base_patch16_224_dino`, which resolves in timm 0.9.x. If your training env pins a
+# different timm (e.g. 1.x), run caching in a DEDICATED env to avoid perturbing training.
+timm==0.9.16
+pytorch-lightning>=2.0
+torchmetrics>=1.0
+einops>=0.6
+omegaconf>=2.2
+scipy
+webdataset
+pandas

@@ -1,0 +1,43 @@
+run_name: ocnwm_pilot_habitat
+
+# OCNWM PILOT on the habitat_replica_random dataset (30 trajs, walking humans).
+# Goal: verify end-to-end training runs on habitat data and loss curves are visible in
+# tensorboard/wandb. CDiT-S/2 from scratch (fast; exercises the exact same OCNWM code
+# paths as XL). Real training uses CDiT-XL/2 + from_checkpoint + finetune_mode.
+
+results_dir: logs
+batch_size: 8
+num_workers: 4
+model: CDiT-S/2
+lr: 1.0e-4
+warmup_steps: 100
+
+normalize: True
+grad_clip_val: 10.0
+context_size: 4
+len_traj_pred: 64
+image_size: 224
+
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+max_steps: 2000           # hard stop for the pilot (~1-2 h on 1 GPU)
+
+# --- OCNWM slots: A2 full two-stage (same knobs as the validated bunker2026 sanity) ---
+slot_mode: full           # off (A0) | context (A1) | full (A2)
+lambda_slot: 1.0
+slot_cache_root: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/slot_cache/ytvis_dino224_k7
+slot_dim: 64
+num_slots: 7
+slot_gmm_modes: 4
+slot_hidden_dim: 256
+eps_wta: 0.1
+slot_regression: mse
+
+datasets:
+  habitat_replica_random:
+    data_folder: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/datasets/habitat_replica_random
+    train: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/data_splits/habitat_replica_random/train
+    test: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/data_splits/habitat_replica_random/test
+    goals_per_obs: 4

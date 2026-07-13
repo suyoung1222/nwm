@@ -84,8 +84,9 @@ class CDiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_slots=True, **block_kwargs):
         super().__init__()
+        self.use_slots = use_slots
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -101,11 +102,36 @@ class CDiTBlock(nn.Module):
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-    def forward(self, x, c, x_cond):
+        # --- OCNWM: exogenous cross-attention branch (predicted slots as key/value) ---
+        # Built ONLY when use_slots (A1/A2); the A0 baseline creates no exo params, so its
+        # state_dict is byte-for-byte the original NWM's and DDP sees no unused parameters.
+        # Appended after the original submodules so their registration order is unchanged.
+        # Separate adaLN_exo (5 chunks) keeps adaLN_modulation at 11 chunks => the pretrained
+        # NWM checkpoint loads unchanged and slots=None stays bit-identical.
+        # add_bias_kv=False so the per-slot (1-g_s) value scale is the *complete* exo gate
+        # (no ungated bias_v leak): g_s=1 fully suppresses the exo contribution.
+        if use_slots:
+            self.norm_exo_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm_exo_kv = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.cttn_exo = nn.MultiheadAttention(hidden_size, num_heads=num_heads, add_bias_kv=False, bias=True, batch_first=True, **block_kwargs)
+            self.adaLN_exo = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 5 * hidden_size, bias=True)
+            )
+
+    def forward(self, x, c, x_cond, slots=None, g_s=None):
         shift_msa, scale_msa, gate_msa, shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(11, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
         x = x + gate_ca_x.unsqueeze(1) * self.cttn(query=modulate(self.norm2(x), shift_ca_x, scale_ca_x), key=x_cond_norm, value=x_cond_norm, need_weights=False)[0]
+        # OCNWM exo branch: self -> x_cond cross -> [exo cross] -> MLP. Skipped entirely when
+        # slots is None (A0), so the computation above/below is bit-identical to baseline NWM.
+        if self.use_slots and slots is not None:
+            shift_exkv, scale_exkv, shift_exq, scale_exq, gate_exq = self.adaLN_exo(c).chunk(5, dim=1)
+            slots_kv = modulate(self.norm_exo_kv(slots), shift_exkv, scale_exkv)       # (B,K,D)
+            value = slots_kv if g_s is None else slots_kv * (1.0 - g_s).unsqueeze(-1)  # per-slot (1-g_s)
+            q = modulate(self.norm_exo_q(x), shift_exq, scale_exq)
+            x = x + gate_exq.unsqueeze(1) * self.cttn_exo(query=q, key=slots_kv, value=value, need_weights=False)[0]
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
         return x
 
@@ -144,6 +170,8 @@ class CDiT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         learn_sigma=True,
+        slot_dim=64,
+        use_slots=True,
     ):
         super().__init__()
         self.context_size = context_size
@@ -152,14 +180,21 @@ class CDiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.slot_dim = slot_dim
+        self.use_slots = use_slots
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = ActionEmbedder(hidden_size)
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(self.context_size + 1, num_patches, hidden_size), requires_grad=True) # for context and for predicted frame
-        self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+        self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_slots=use_slots) for _ in range(depth)])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.time_embedder = TimestepEmbedder(hidden_size)
+        # OCNWM: projects predicted slots (B,K,slot_dim) -> (B,K,hidden) for the exo K/V.
+        # Built only under use_slots (A1/A2); constructed last so it never perturbs the RNG
+        # draws of the baseline submodules. A0 (use_slots=False) is structurally the original.
+        if use_slots:
+            self.slot_proj = nn.Linear(slot_dim, hidden_size)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -201,6 +236,11 @@ class CDiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            # OCNWM: zero-init the exo adaLN so gate_exq==0 at start => the exo branch adds
+            # exactly 0 even when slots are supplied (initial output unchanged by slots).
+            if self.use_slots:
+                nn.init.constant_(block.adaLN_exo[-1].weight, 0)
+                nn.init.constant_(block.adaLN_exo[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -223,12 +263,15 @@ class CDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, x_cond, rel_t):
+    def forward(self, x, t, y, x_cond, rel_t, slots=None, g_s=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        slots: (N, K, slot_dim) predicted object slots for the exo cross-attention (or None).
+               When None, the exo branch is skipped entirely (bit-identical to baseline NWM).
+        g_s:   (N, K) per-slot ego-explainability gate; the exo value is scaled by (1-g_s).
         """
         x = self.x_embedder(x) + self.pos_embed[self.context_size:]
         x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
@@ -238,8 +281,10 @@ class CDiT(nn.Module):
         time_emb = self.time_embedder(rel_t[..., None]) # timeshift k → ψ_k
         c = t + time_emb + y # if training on unlabeled data, dont add y. # ξ = ψ_a + ψ_k + ψ_t  (Eq.3)
 
+        slots_kv = self.slot_proj(slots) if (self.use_slots and slots is not None) else None  # (N,K,hidden) or None
+
         for block in self.blocks:
-            x = block(x, c, x_cond)
+            x = block(x, c, x_cond, slots=slots_kv, g_s=g_s)
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         return x

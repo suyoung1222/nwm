@@ -1,0 +1,3 @@
+[submodule "thirdparty/videosaur"]
+	path = thirdparty/videosaur
+	url = https://github.com/martius-lab/videosaur.git

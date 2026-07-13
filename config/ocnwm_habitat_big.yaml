@@ -1,0 +1,44 @@
+run_name: ocnwm_habitat_big
+
+# OCNWM real training: CDiT-XL/2 finetuned from the Ego4D-pretrained NWM checkpoint on
+# the habitat_replica_random_big dataset (660 trajs, walking humans), slot_mode=full.
+# The exo branch + slot_model are absent from the checkpoint: train.py loads non-strict
+# when use_slots (strict_load = not use_slots), so the exo branch opens from zero-init
+# exactly as designed.
+from_checkpoint: /scratch/workspace/suyoungkang_umass_edu-ocnwm/nwm_original/nwm/logs/nwm_cdit_xl/checkpoints/cdit_xl_ego4d_200000.pth.tar
+finetune_mode: True   # load model/EMA weights only; reset optimizer and step counters
+
+results_dir: logs
+batch_size: 4          # per GPU (proven on 40GB-class GPUs for XL finetune); global 16 on 4 GPUs
+num_workers: 8
+model: CDiT-XL/2
+lr: 2e-5               # finetune LR (pretraining used 8e-5)
+warmup_steps: 1000
+
+normalize: True
+grad_clip_val: 10.0
+context_size: 4
+len_traj_pred: 64
+image_size: 224
+
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+# --- OCNWM slots: A2 full two-stage ---
+slot_mode: full        # off (A0) | context (A1) | full (A2)
+lambda_slot: 1.0
+slot_cache_root: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/slot_cache/ytvis_dino224_k7
+slot_dim: 64
+num_slots: 7
+slot_gmm_modes: 4
+slot_hidden_dim: 256
+eps_wta: 0.1
+slot_regression: mse
+
+datasets:
+  habitat_replica_random_big:
+    data_folder: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/datasets/habitat_replica_random_big
+    train: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/data_splits/habitat_replica_random_big/train
+    test: /scratch/workspace/suyoungkang_umass_edu-ocnwm/data/preprocessed/data_splits/habitat_replica_random_big/test
+    goals_per_obs: 4

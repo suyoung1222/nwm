@@ -31,3 +31,15 @@ bunker:
 
 bunker2025:
   metric_waypoint_spacing: 0.2678 # UMass AgileX Bunker outdoor (mean step spacing over 7 seqs)
+
+bunker2026:
+  metric_waypoint_spacing: 0.29 # UMass AgileX Bunker outdoor (bunker2026, matches nwm_original)
+
+habitat_replica:
+  metric_waypoint_spacing: 0.2589 # Habitat 3.0 ReplicaCAD sim (walking human avatar); mean step over 114 trajs
+
+habitat_replica_random:
+  metric_waypoint_spacing: 0.2326 # Habitat 3.0 ReplicaCAD randomized collector (pilot); mean of per-traj mean_step over 30 trajs (_manifest.json)
+
+habitat_replica_random_big:
+  metric_waypoint_spacing: 0.2326 # same generator distribution (step_range 0.15-0.30) as the pilot; verify against merged manifests after generation

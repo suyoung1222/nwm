@@ -36,6 +36,8 @@ from distributed import init_distributed
 from models import CDiT_models
 from diffusion import create_diffusion
 from datasets import TrainingDataset
+from slot_dataset import SlotTrainingDataset
+from slot_transition import SlotTransitionPredictor, SlotGate, compute_slot_conditioning
 from misc import transform
 from logging_utils import TrainLogger, make_rollout_images, gpu_utilization, gpu_mem_gb
 
@@ -210,15 +212,52 @@ def main(args):
 
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     num_cond = config['context_size']
-    model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4).to(device)
+
+    # --- OCNWM slot config (ADDITIVE). slot_mode='off' == baseline NWM (bit-identical):
+    #     the CDiT is built with use_slots=False so no exo params exist at all. ---
+    slot_mode = config.get('slot_mode', 'off')
+    assert slot_mode in ('off', 'context', 'full'), f"slot_mode must be off|context|full, got {slot_mode!r}"
+    use_slots = (slot_mode != 'off')
+    slot_dim = int(config.get('slot_dim', 64))
+    num_slots = int(config.get('num_slots', 7))
+    lambda_slot = float(config.get('lambda_slot', 1.0))
+    slot_gmm_modes = int(config.get('slot_gmm_modes', 4))
+    slot_hidden_dim = int(config.get('slot_hidden_dim', 256))
+    eps_wta = float(config.get('eps_wta', 0.0))
+    slot_regression = config.get('slot_regression', 'mse')
+    slot_cache_root = config.get('slot_cache_root', None)
+    if use_slots:
+        assert slot_cache_root is not None, "slot_mode != off requires config['slot_cache_root']"
+    logger.info(f"OCNWM slot_mode={slot_mode} (use_slots={use_slots}) lambda_slot={lambda_slot} "
+                f"slot_dim={slot_dim} num_slots={num_slots} gmm_modes={slot_gmm_modes}")
+
+    model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4,
+                                         use_slots=use_slots, slot_dim=slot_dim).to(device)
     # Model이 받는 context는 (B, m, 4, H/8, W/8) 형태의 VAE latent. m=4이면 프레임당 32×32=1024개 token이 4프레임 = 4096 context tokens.
     
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    
+
+    # --- OCNWM Stage-1 module (ADDITIVE): full -> transition predictor; context -> standalone
+    #     gate (A1, option-1). None for slot_mode='off'. Trained jointly with the CDiT. ---
+    slot_model = None
+    if slot_mode == 'full':
+        slot_model = SlotTransitionPredictor(
+            slot_dim=slot_dim, num_slots=num_slots, action_dim=3,
+            hidden_dim=slot_hidden_dim, cond_dim=slot_hidden_dim, num_modes=slot_gmm_modes,
+        ).to(device)
+    elif slot_mode == 'context':
+        slot_model = SlotGate(slot_dim=slot_dim, hidden_dim=slot_hidden_dim).to(device)
+    if slot_model is not None:
+        logger.info(f"Stage-1 slot_model ({slot_mode}) params: "
+                    f"{sum(p.numel() for p in slot_model.parameters()):,}")
+
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     lr = float(config.get('lr', 1e-4))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+    opt_params = list(model.parameters())
+    if slot_model is not None:
+        opt_params += list(slot_model.parameters())   # jointly optimized, one LR schedule
+    opt = torch.optim.AdamW(opt_params, lr=lr, weight_decay=0)
     # Fine-tuning schedule knobs (ADDITIVE; 0 == original behavior):
     #   warmup_steps>0 : linear 0 -> lr over the first N optimizer steps, then constant.
     #   max_steps>0    : hard stop once train_steps reaches this count.
@@ -252,18 +291,36 @@ def main(args):
                 raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
         latest_path = latest_path if have_latest else config.get('from_checkpoint', 0)
         print("Loading model from", latest_path, "| finetune_mode=" + str(finetune_mode))
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
+        # device is the int GPU index from init_distributed(); torch.load treats a bare
+        # int map_location as a callable -> TypeError, so format it as a device string.
+        latest_checkpoint = torch.load(latest_path, map_location=f"cuda:{device}", weights_only=False)
 
         if "model" in latest_checkpoint:
+            # OCNWM: a *baseline* CDiT checkpoint has no exo/slot_proj keys, so when use_slots
+            # we load non-strict and require the only-missing keys to be exactly those new
+            # modules (they stay zero-init => bit-identical start, exo opens from 0).
+            strict_load = not use_slots
+            def _check(res_):
+                if not strict_load:
+                    bad = [k for k in res_.missing_keys if ('exo' not in k and not k.startswith('slot_proj'))]
+                    assert not bad, f"checkpoint missing non-slot keys: {bad[:6]}"
+                    assert not res_.unexpected_keys, f"checkpoint has unexpected keys: {res_.unexpected_keys[:6]}"
+
             model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
-            res = model.load_state_dict(model_ckp, strict=True)
+            res = model.load_state_dict(model_ckp, strict=strict_load); _check(res)
             print("Loading model weights", res)
 
             model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
-            res = ema.load_state_dict(model_ckp, strict=True)
+            res = ema.load_state_dict(model_ckp, strict=strict_load); _check(res)
             print("Loading EMA model weights", res)
         else:
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+
+        # OCNWM: restore the Stage-1 slot_model if present (never fails a baseline resume).
+        if slot_model is not None and "slot_model" in latest_checkpoint:
+            sm_ckp = {k.replace('_orig_mod.', ''): v for k, v in latest_checkpoint['slot_model'].items()}
+            res = slot_model.load_state_dict(sm_ckp, strict=True)
+            print("Loading slot_model weights", res)
 
         if not finetune_mode:
             if "opt" in latest_checkpoint:
@@ -286,6 +343,10 @@ def main(args):
     if args.torch_compile:
         model = torch.compile(model)
     model = DDP(model, device_ids=[device])
+    if slot_model is not None:
+        # find_unused_parameters=True for 'full': logvar_head is unused under MSE regression
+        # (computed but not in the loss), so its grads are absent and DDP must tolerate that.
+        slot_model = DDP(slot_model, device_ids=[device], find_unused_parameters=(slot_mode == 'full'))
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     # Fewer-step diffusion used ONLY for periodic rollout-image logging (faster
     # sampling for viz). Does not touch the training objective above.
@@ -318,7 +379,12 @@ def main(args):
                     else:
                         len_traj_pred=config["len_traj_pred"]
 
-                    dataset = TrainingDataset(
+                    # OCNWM: only the TRAIN split attaches slots (val/rollout viz stays the
+                    # plain 3-tuple so the sampling/logging path is untouched this round).
+                    use_slot_ds = use_slots and (data_split_type == "train")
+                    ds_cls = SlotTrainingDataset if use_slot_ds else TrainingDataset
+                    slot_kwargs = dict(cache_root=slot_cache_root) if use_slot_ds else {}
+                    dataset = ds_cls(
                         data_folder=data_config["data_folder"],
                         data_split_folder=data_config[data_split_type],
                         dataset_name=dataset_name,
@@ -332,6 +398,7 @@ def main(args):
                         transform=transform,
                         predefined_index=None,
                         traj_stride=1,
+                        **slot_kwargs,
                     )
                     if data_split_type == "train":
                         train_dataset.append(dataset)
@@ -414,6 +481,9 @@ def main(args):
     running_loss = 0
     running_mse = 0.0     # additive: accumulate diffusion MSE term
     running_vb = 0.0      # additive: accumulate vlb term (0 if model has no vb)
+    running_l_diff = 0.0  # OCNWM: diffusion term (L_diff) running sum
+    running_l_slot = 0.0  # OCNWM: slot term (L_slot) running sum
+    last_slot_stats = None # OCNWM: most recent Stage-1 diagnostics (g_s, pi entropy, ...)
     last_grad_norm = None # additive: most recent total grad norm
     start_time = time()
 
@@ -422,7 +492,13 @@ def main(args):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
-        for x, y, rel_t in loader:
+        for batch in loader:
+            if use_slots:
+                x, y, rel_t, past_slots, target_slots = batch
+                past_slots = past_slots.to(device, non_blocking=True)      # (B, ctx, K, D)
+                target_slots = target_slots.to(device, non_blocking=True)  # (B, goals, K, D)
+            else:
+                x, y, rel_t = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             rel_t = rel_t.to(device, non_blocking=True)
@@ -446,11 +522,31 @@ def main(args):
                 x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
                 y = y.flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
-                
+
                 t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
                 model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+
+                # --- OCNWM Stage-1: predict slots + gate, inject into the CDiT exo branch ---
+                # past_slots share the context across goals, so broadcast them over the goal
+                # axis exactly like x_cond, then flatten to match x_start's (B*goals) batch.
+                l_slot = x_start.new_zeros(())
+                slot_stats = None
+                if use_slots:
+                    K, Dslot = past_slots.shape[2], past_slots.shape[3]
+                    past_flat = past_slots.unsqueeze(1).expand(B, num_goals, num_cond, K, Dslot).flatten(0, 1)
+                    target_flat = target_slots.flatten(0, 1)          # (B*goals, K, Dslot)
+                    cond = compute_slot_conditioning(
+                        slot_mode, slot_model, past_flat, target_flat, y, rel_t,
+                        eps_wta=eps_wta, regression=slot_regression,
+                    )
+                    model_kwargs["slots"] = cond["slots"]             # no detach (full) / frozen (context)
+                    model_kwargs["g_s"] = cond["g_s"]
+                    l_slot = cond["l_slot"]
+                    slot_stats = cond["stats"]
+
                 loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
-                loss = loss_dict["loss"].mean()
+                l_diff = loss_dict["loss"].mean()
+                loss = l_diff + lambda_slot * l_slot                  # L_total = L_diff + λ·L_slot
 
             opt.zero_grad()
             if not bfloat_enable:
@@ -461,7 +557,10 @@ def main(args):
                 if config.get('grad_clip_val', 0) > 0:
                     scaler.unscale_(opt)
                     # clip_grad_norm_ already returns the total norm — capture for logging (no behavior change)
-                    last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val']).item()
+                    clip_params = list(model.parameters())
+                    if slot_model is not None:
+                        clip_params += list(slot_model.parameters())
+                    last_grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, max_norm=config['grad_clip_val']).item()
                 scaler.step(opt)
                 scaler.update()
             
@@ -472,6 +571,11 @@ def main(args):
             # Additive: accumulate loss components for logging (no math change)
             running_mse += loss_dict["mse"].mean().item() if "mse" in loss_dict else 0.0
             running_vb += loss_dict["vb"].mean().item() if "vb" in loss_dict else 0.0
+            # OCNWM: L_diff / L_slot breakdown + latest Stage-1 diagnostics
+            running_l_diff += l_diff.detach().item()
+            running_l_slot += float(l_slot.detach())
+            if slot_stats is not None:
+                last_slot_stats = slot_stats
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -486,7 +590,7 @@ def main(args):
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
                 # Experiment-tracker logging (rank-0 no-op wrapper handles non-main ranks):
-                train_logger.log_scalars({
+                logs = {
                     "train/loss": avg_loss,
                     "train/mse": running_mse / log_steps,
                     "train/vb": running_vb / log_steps,
@@ -497,11 +601,36 @@ def main(args):
                     "perf/gpu_util": gpu_utilization(),
                     "perf/gpu_mem_gb": gpu_mem_gb(),
                     "progress/epoch": epoch,
-                }, train_steps)
+                }
+                # OCNWM: L_diff / L_slot raw magnitudes + ratio, and Stage-1 diagnostics
+                # (per-slot g_s means, pi entropy / effective #modes K_eff).
+                if use_slots:
+                    avg_l_diff = running_l_diff / log_steps
+                    avg_l_slot = running_l_slot / log_steps
+                    logs["train/l_diff"] = avg_l_diff
+                    logs["train/l_slot"] = avg_l_slot
+                    logs["train/l_slot_over_l_diff"] = avg_l_slot / max(avg_l_diff, 1e-9)
+                    if last_slot_stats is not None:
+                        logger.info(
+                            f"          L_diff={avg_l_diff:.4f} L_slot={avg_l_slot:.4f} "
+                            f"(reg={last_slot_stats.get('reg', 0):.4f} ce={last_slot_stats.get('ce', 0):.4f}) "
+                            f"g_s_mean={last_slot_stats['g_s_mean']:.3f} K_eff={last_slot_stats['k_eff']:.2f}")
+                        logs["train/g_s_mean"] = last_slot_stats["g_s_mean"]
+                        logs["train/pi_entropy"] = last_slot_stats["pi_entropy"]
+                        logs["train/k_eff"] = last_slot_stats["k_eff"]
+                        for k, v in enumerate(last_slot_stats["g_s_per_slot"]):
+                            logs[f"train/g_s_slot_{k}"] = v
+                        if "reg" in last_slot_stats:
+                            logs["train/l_slot_reg"] = last_slot_stats["reg"]
+                        if "ce" in last_slot_stats:
+                            logs["train/l_slot_ce"] = last_slot_stats["ce"]
+                train_logger.log_scalars(logs, train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
                 running_mse = 0.0
                 running_vb = 0.0
+                running_l_diff = 0.0
+                running_l_slot = 0.0
                 log_steps = 0
                 start_time = time()
 
@@ -516,6 +645,9 @@ def main(args):
                         "epoch": epoch,
                         "train_steps": train_steps
                     }
+                    if slot_model is not None:  # OCNWM Stage-1 weights (key absent for A0)
+                        checkpoint["slot_model"] = slot_model.module.state_dict()
+                        checkpoint["slot_mode"] = slot_mode
                     if bfloat_enable:
                         checkpoint.update({"scaler": scaler.state_dict()})
                     checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
